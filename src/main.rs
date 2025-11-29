@@ -49,14 +49,22 @@ impl Hasher for FastHasher {
     }
 }
 
-const INLINE: usize = 16;
+const INLINE: usize = std::mem::size_of::<AllocedStrVec>();
 const LAST: usize = INLINE - 1;
 
+#[repr(C)]
 union StrVec {
     inlined: [u8; INLINE],
+    heap: AllocedStrVec,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AllocedStrVec {
     // if length high bit is set, then inlined into pointer then len
     // otherwise, pointer is a pointer to Vec<u8>
-    heap: (usize, *mut u8),
+    len: usize,
+    ptr: *mut u8,
 }
 
 // SAFETY: effectively just a Vec<str>, which is fine across thread boundaries
@@ -72,7 +80,10 @@ impl StrVec {
         } else {
             let ptr = Box::into_raw(s.to_vec().into_boxed_slice());
             Self {
-                heap: (ptr.len().to_be(), ptr as *mut u8),
+                heap: AllocedStrVec {
+                    len: ptr.len().to_be(),
+                    ptr: ptr.cast(),
+                },
             }
         }
     }
@@ -82,8 +93,8 @@ impl Drop for StrVec {
     fn drop(&mut self) {
         if unsafe { self.inlined[LAST] } == 0x00 {
             unsafe {
-                let len = usize::from_be(self.heap.0);
-                let ptr = self.heap.1;
+                let len = usize::from_be(self.heap.len);
+                let ptr = self.heap.ptr;
                 let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
                 let _ = Box::from_raw(slice_ptr);
             }
@@ -99,8 +110,8 @@ impl AsRef<[u8]> for StrVec {
                 std::slice::from_raw_parts(self.inlined.as_ptr(), len)
             } else {
                 std::hint::cold_path();
-                let len = usize::from_be(self.heap.0);
-                let ptr = self.heap.1;
+                let len = usize::from_be(self.heap.len);
+                let ptr = self.heap.ptr;
                 std::slice::from_raw_parts(ptr, len)
             }
         }
