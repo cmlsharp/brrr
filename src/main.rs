@@ -164,21 +164,22 @@ fn main() {
     print!("}}");
 }
 
+#[inline]
 fn next_line<'a>(map: &'a [u8], at: &mut usize) -> &'a [u8] {
     let rest = &map[*at..];
     // SAFETY: rest is valid for at least rest.len() bytes
     let next_newline =
         unsafe { libc::memchr(rest.as_ptr() as *const c_void, b'\n' as c_int, rest.len()) };
-    let line = if next_newline.is_null() {
+    if next_newline.is_null() {
         // don't need to remember to break, since next iteration will find empty line
+        *at += rest.len();
         rest
     } else {
         // SAFETY: memchr always returns pointers in rest, which are valid
         let len = unsafe { (next_newline as *const u8).offset_from(rest.as_ptr()) } as usize;
+        *at += len + 1;
         &rest[..len]
-    };
-    *at += line.len() + 1;
-    line
+    }
 }
 
 fn split_semi(line: &[u8]) -> (&[u8], &[u8]) {
