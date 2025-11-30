@@ -8,15 +8,11 @@ use std::io::Write;
 use std::{
     borrow::Borrow,
     collections::{BTreeMap, HashMap, btree_map::Entry},
-    ffi::{c_int, c_void},
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
     os::fd::AsRawFd,
-    simd::{cmp::SimdPartialEq, u8x64},
+    simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq},
 };
-
-const SEMI: u8x64 = u8x64::splat(b';');
-const NEWL: u8x64 = u8x64::splat(b'\n');
 
 struct FastHasherBuilder;
 struct FastHasher(u64);
@@ -166,7 +162,7 @@ fn main() {
             let end = if end == map.len() {
                 map.len()
             } else {
-                let newline_at = next_newline(&map[end..], 0);
+                let newline_at = find_newline(&map[end..]).unwrap();
                 end + newline_at + 1
             };
             let map = &map[start..end];
@@ -232,10 +228,10 @@ fn one(map: &[u8]) -> HashMap<StrVec, Stat, FastHasherBuilder> {
     let mut stats = HashMap::with_capacity_and_hasher(1_024, FastHasherBuilder);
     let mut at = 0;
     while at < map.len() {
-        let newline_at = at + next_newline(map, at);
+        let newline_at = at + unsafe { find_newline(&map[at..]).unwrap_unchecked() };
         let line = unsafe { map.get_unchecked(at..newline_at) };
         at = newline_at + 1;
-        let semi = semi_at(line);
+        let semi = unsafe { find_semicolon(line).unwrap_unchecked() };
         let station = unsafe { line.get_unchecked(..semi) };
         let temperature = unsafe { line.get_unchecked(semi + 1..) };
         let t = parse_temperature(temperature);
@@ -259,50 +255,34 @@ fn update_stats(stats: &mut HashMap<StrVec, Stat, FastHasherBuilder>, station: &
     stats.count += 1;
 }
 
-#[inline]
-fn next_newline(map: &[u8], at: usize) -> usize {
-    let rest = unsafe { map.get_unchecked(at..) };
-    let against = if let Some(restu8x64) = rest.first_chunk::<64>() {
-        u8x64::from_array(*restu8x64)
-    } else {
-        std::hint::cold_path();
-        u8x64::load_or_default(rest)
-    };
-    let newline_eq = NEWL.simd_eq(against);
-    if let Some(i) = newline_eq.first_set() {
-        i
-    } else {
-        // we know, line is at most 100+1+5 = 106b,
-        // but we can only search 64b, so the search _may_ have to fall back to memchr
-        // we know there _must_ be a newline, so rest[64..] must be non-empty
-        std::hint::cold_path();
-        let restrest = unsafe { rest.get_unchecked(64..) };
-        // SAFETY: restrest is valid for at least restrest.len() bytes
-        let next_newline = unsafe {
-            libc::memchr(
-                restrest.as_ptr() as *const c_void,
-                b'\n' as c_int,
-                restrest.len(),
-            )
-        };
-        assert!(!next_newline.is_null());
-        // SAFETY: memchr always returns pointers in restrest, which are valid
-        let len = unsafe { (next_newline as *const u8).offset_from(restrest.as_ptr()) } as usize;
-        64 + len
-    }
+// These lane counts were empirically set on my machine,
+// This may be architecture specific.
+const NL_LANES: usize = 16;
+const SC_LANES: usize = 8;
+
+fn find_newline(buffer: &[u8]) -> Option<usize> {
+    find_byte_simd::<NL_LANES>(b'\n', buffer)
 }
 
-#[inline]
-fn semi_at(line: &[u8]) -> usize {
-    // we know, line is at most 100+1+5 = 106b
-    if line.len() > 64 {
-        std::hint::cold_path();
-        line.iter().position(|c| *c == b';').unwrap()
-    } else {
-        let delim_eq = SEMI.simd_eq(u8x64::load_or_default(line));
-        // SAFETY: we're promised there is a ; in every line
-        unsafe { delim_eq.first_set().unwrap_unchecked() }
+fn find_semicolon(buffer: &[u8]) -> Option<usize> {
+    find_byte_simd::<SC_LANES>(b';', buffer)
+}
+
+fn find_byte_simd<const LANES: usize>(byte: u8, buffer: &[u8]) -> Option<usize>
+where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    let mut i = 0;
+    while i + LANES <= buffer.len() {
+        let bytes = Simd::<u8, LANES>::from_slice(&buffer[i..i + LANES]);
+        let mask = bytes.simd_eq(Simd::splat(byte));
+        if let Some(set) = mask.first_set() {
+            return Some(i + set);
+        }
+        i += LANES;
     }
+    std::hint::cold_path();
+    buffer[i..].iter().position(|&b| b == byte).map(|p| i + p)
 }
 
 #[inline]
