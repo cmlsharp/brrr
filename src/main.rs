@@ -11,6 +11,7 @@ use std::{
     ffi::{c_int, c_void},
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
+    mem::ManuallyDrop,
     os::fd::AsRawFd,
     simd::{cmp::SimdPartialEq, u8x64},
 };
@@ -55,16 +56,24 @@ const LAST: usize = INLINE - 1;
 #[repr(C)]
 union StrVec {
     inlined: [u8; INLINE],
-    heap: AllocedStrVec,
+    heap: ManuallyDrop<AllocedStrVec>,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct AllocedStrVec {
     // if length high bit is set, then inlined into pointer then len
     // otherwise, pointer is a pointer to Vec<u8>
     len: usize,
     ptr: *mut u8,
+}
+
+impl Drop for AllocedStrVec {
+    fn drop(&mut self) {
+        let len = usize::from_be(self.len);
+        let ptr = self.ptr;
+        let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        let _ = unsafe { Box::from_raw(slice_ptr) };
+    }
 }
 
 // SAFETY: effectively just a Vec<str>, which is fine across thread boundaries
@@ -80,10 +89,10 @@ impl StrVec {
         } else {
             let ptr = Box::into_raw(s.to_vec().into_boxed_slice());
             Self {
-                heap: AllocedStrVec {
+                heap: ManuallyDrop::new(AllocedStrVec {
                     len: ptr.len().to_be(),
                     ptr: ptr.cast(),
-                },
+                }),
             }
         }
     }
@@ -91,12 +100,9 @@ impl StrVec {
 
 impl Drop for StrVec {
     fn drop(&mut self) {
-        if unsafe { self.inlined[LAST] } == 0x00 {
-            unsafe {
-                let len = usize::from_be(self.heap.len);
-                let ptr = self.heap.ptr;
-                let slice_ptr = std::ptr::slice_from_raw_parts_mut(ptr, len);
-                let _ = Box::from_raw(slice_ptr);
+        unsafe {
+            if self.inlined[LAST] == 0x00 {
+                ManuallyDrop::drop(&mut self.heap)
             }
         }
     }
