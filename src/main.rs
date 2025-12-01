@@ -11,7 +11,7 @@ use std::{
     fs::File,
     hash::{BuildHasher, Hash, Hasher},
     os::fd::AsRawFd,
-    simd::{LaneCount, Simd, SupportedLaneCount, cmp::SimdPartialEq},
+    simd::{Simd, cmp::SimdPartialEq},
 };
 
 struct FastHasherBuilder;
@@ -231,9 +231,7 @@ fn one(map: &[u8]) -> HashMap<StrVec, Stat, FastHasherBuilder> {
         let newline_at = at + unsafe { find_newline(&map[at..]).unwrap_unchecked() };
         let line = unsafe { map.get_unchecked(at..newline_at) };
         at = newline_at + 1;
-        let semi = unsafe { find_semicolon(line).unwrap_unchecked() };
-        let station = unsafe { line.get_unchecked(..semi) };
-        let temperature = unsafe { line.get_unchecked(semi + 1..) };
+        let (station, temperature) = unsafe { split_at_semicolon(line) };
         let t = parse_temperature(temperature);
         update_stats(&mut stats, station, t);
     }
@@ -255,34 +253,42 @@ fn update_stats(stats: &mut HashMap<StrVec, Stat, FastHasherBuilder>, station: &
     stats.count += 1;
 }
 
-// These lane counts were empirically set on my machine,
-// This may be architecture specific.
-const NL_LANES: usize = 16;
-const SC_LANES: usize = 8;
+// SAFETY: buffer must contain a semicolon in the last min(8, buffer.len()) bytes
+unsafe fn split_at_semicolon(buffer: &[u8]) -> (&[u8], &[u8]) {
+    const LANES: usize = 8;
+    const SPLAT: Simd<u8, LANES> = Simd::splat(b';');
 
-fn find_newline(buffer: &[u8]) -> Option<usize> {
-    find_byte_simd::<NL_LANES>(b'\n', buffer)
+    let bytes = if let Some(chunk) = buffer.last_chunk() {
+        Simd::<u8, LANES>::from_array(*chunk)
+    } else {
+        std::hint::cold_path();
+        Simd::<u8, LANES>::load_or_default(buffer)
+    };
+
+    let set_pos = unsafe { bytes.simd_eq(SPLAT).first_set().unwrap_unchecked() };
+    // there is no Mask::last_set, but we know there's only 1 ;
+    let pos = buffer.len() - LANES + set_pos;
+    let (before, after) = unsafe { buffer.split_at_unchecked(pos + 1) };
+    (&before[..before.len() - 1], after)
 }
 
-fn find_semicolon(buffer: &[u8]) -> Option<usize> {
-    find_byte_simd::<SC_LANES>(b';', buffer)
-}
+pub fn find_newline(mut buffer: &[u8]) -> Option<usize> {
+    const LANES: usize = 32;
+    const SPLAT: Simd<u8, LANES> = Simd::splat(b'\n');
 
-fn find_byte_simd<const LANES: usize>(byte: u8, buffer: &[u8]) -> Option<usize>
-where
-    LaneCount<LANES>: SupportedLaneCount,
-{
     let mut i = 0;
-    while i + LANES <= buffer.len() {
-        let bytes = Simd::<u8, LANES>::from_slice(&buffer[i..i + LANES]);
-        let mask = bytes.simd_eq(Simd::splat(byte));
-        if let Some(set) = mask.first_set() {
-            return Some(i + set);
+    while let Some((chunk, rest)) = buffer.split_first_chunk() {
+        let bytes = Simd::<u8, LANES>::from_array(*chunk);
+        let index = bytes.simd_eq(SPLAT).first_set().map(|set| set + i);
+        if index.is_some() {
+            return index;
         }
         i += LANES;
+        buffer = rest;
     }
-    std::hint::cold_path();
-    buffer[i..].iter().position(|&b| b == byte).map(|p| i + p)
+
+    let bytes = Simd::<u8, LANES>::load_or_default(buffer);
+    bytes.simd_eq(SPLAT).first_set().map(|set| set + i)
 }
 
 #[inline]
