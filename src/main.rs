@@ -323,21 +323,15 @@ fn update_stats(stats: &mut HashMap<StrVec, Stat, FastHasherBuilder>, station: &
 
 // SAFETY: buffer must contain a semicolon in the last min(8, buffer.len()) bytes
 unsafe fn split_at_semicolon(buffer: &[u8]) -> (&[u8], &[u8]) {
-    const LANES: usize = 8;
-    const SPLAT: Simd<u8, LANES> = Simd::splat(b';');
-
-    let bytes = if let Some(chunk) = buffer.last_chunk() {
-        Simd::<u8, LANES>::from_array(*chunk)
-    } else {
-        std::hint::cold_path();
-        Simd::<u8, LANES>::load_or_default(buffer)
-    };
-
-    let set_pos = unsafe { bytes.simd_eq(SPLAT).first_set().unwrap_unchecked() };
-    // there is no Mask::last_set, but we know there's only 1 ;
-    let pos = buffer.len() - LANES + set_pos;
-    let (before, after) = unsafe { buffer.split_at_unchecked(pos + 1) };
-    (&before[..before.len() - 1], after)
+    let mut pos = buffer.len() - 4;
+    unsafe {
+        // SAFETY: readme promises there will be a semicolon
+        while *buffer.get_unchecked(pos) != b';' {
+            pos -= 1;
+        }
+        let (before, after) = buffer.split_at_unchecked(pos + 1);
+        (&before[..before.len() - 1], after)
+    }
 }
 
 pub fn find_newline(mut buffer: &[u8]) -> Option<usize> {
